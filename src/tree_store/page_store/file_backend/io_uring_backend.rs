@@ -30,6 +30,13 @@ impl FileBackend {
     /// Creates a new backend which stores data to the given file.
     /// Attempts to use io_uring if available, falls back to standard pread/pwrite.
     pub fn new(file: File) -> Result<Self, DatabaseError> {
+        // TEMPORARY: Force standard backend to compare benchmarks
+        // TODO: Remove this to re-enable io_uring
+        Ok(Self {
+            inner: FileBackendInner::Standard(StandardFileBackend::new(file)?),
+        })
+
+        /*
         // Try to create io_uring ring
         match io_uring::IoUring::new(RING_SIZE) {
             Ok(ring) => {
@@ -48,6 +55,7 @@ impl FileBackend {
                 })
             }
         }
+        */
     }
 }
 
