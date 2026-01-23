@@ -99,6 +99,7 @@ mod complex_types;
 mod db;
 mod error;
 mod multimap_table;
+pub mod page_crypto;
 #[cfg(feature = "python")]
 mod python;
 mod sealed;
@@ -108,6 +109,11 @@ mod transactions;
 mod tree_store;
 mod tuple_types;
 mod types;
+
+// Re-export page crypto types
+pub use page_crypto::{NoOpPageCrypto, PageCrypto};
+#[cfg(feature = "encryption")]
+pub use page_crypto::Aes256GcmPageCrypto;
 
 #[cfg(test)]
 fn create_tempfile() -> tempfile::NamedTempFile {

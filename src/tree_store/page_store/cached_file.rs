@@ -1,3 +1,4 @@
+use crate::page_crypto::PageCrypto;
 use crate::tree_store::page_store::base::PageHint;
 use crate::tree_store::page_store::lru_cache::LRUCache;
 use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
@@ -108,17 +109,43 @@ impl LRUWriteCache {
     }
 }
 
-#[derive(Debug)]
 struct CheckedBackend {
     file: Box<dyn StorageBackend>,
     io_failed: AtomicBool,
+    crypto: Option<Arc<dyn PageCrypto>>,
+    page_size: usize,
+}
+
+impl std::fmt::Debug for CheckedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedBackend")
+            .field("io_failed", &self.io_failed)
+            .field("has_crypto", &self.crypto.is_some())
+            .field("page_size", &self.page_size)
+            .finish()
+    }
 }
 
 impl CheckedBackend {
-    fn new(file: Box<dyn StorageBackend>) -> Self {
+    fn new(file: Box<dyn StorageBackend>, page_size: usize) -> Self {
         Self {
             file,
             io_failed: AtomicBool::new(false),
+            crypto: None,
+            page_size,
+        }
+    }
+
+    fn with_crypto(
+        file: Box<dyn StorageBackend>,
+        page_size: usize,
+        crypto: Arc<dyn PageCrypto>,
+    ) -> Self {
+        Self {
+            file,
+            io_failed: AtomicBool::new(false),
+            crypto: Some(crypto),
+            page_size,
         }
     }
 
@@ -149,7 +176,17 @@ impl CheckedBackend {
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         }
-        result.map_err(StorageError::from)
+        let data = result.map_err(StorageError::from)?;
+
+        // Decrypt if crypto is configured and this is a full page read
+        if let Some(ref crypto) = self.crypto {
+            if len == self.page_size && offset >= crypto.encryption_start_offset() {
+                return crypto
+                    .decrypt(offset, &data, self.page_size)
+                    .map_err(|e| StorageError::Io(e));
+            }
+        }
+        Ok(data)
     }
 
     fn set_len(&self, len: u64) -> Result<()> {
@@ -172,7 +209,58 @@ impl CheckedBackend {
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         self.check_failure()?;
-        let result = self.file.write(offset, data);
+
+        // Encrypt if crypto is configured and this is a full page write
+        let data_to_write: std::borrow::Cow<'_, [u8]> = if let Some(ref crypto) = self.crypto {
+            if data.len() == self.page_size && offset >= crypto.encryption_start_offset() {
+                let encrypted = crypto
+                    .encrypt(offset, data, self.page_size)
+                    .map_err(|e| StorageError::Io(e))?;
+                std::borrow::Cow::Owned(encrypted)
+            } else {
+                std::borrow::Cow::Borrowed(data)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(data)
+        };
+
+        let result = self.file.write(offset, &data_to_write);
+        if result.is_err() {
+            self.io_failed.store(true, Ordering::Release);
+        }
+        result.map_err(StorageError::from)
+    }
+
+    fn write_batch(&self, ops: &[(u64, Arc<[u8]>)]) -> Result<()> {
+        self.check_failure()?;
+
+        // Encrypt all pages first (if crypto is configured)
+        let encrypted_ops: Vec<(u64, Vec<u8>)> = if let Some(ref crypto) = self.crypto {
+            ops.iter()
+                .map(|(offset, data)| {
+                    if data.len() == self.page_size && *offset >= crypto.encryption_start_offset() {
+                        let encrypted = crypto
+                            .encrypt(*offset, data, self.page_size)
+                            .map_err(|e| StorageError::Io(e))?;
+                        Ok((*offset, encrypted))
+                    } else {
+                        Ok((*offset, data.to_vec()))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            ops.iter()
+                .map(|(offset, data)| (*offset, data.to_vec()))
+                .collect()
+        };
+
+        // Convert to the format expected by StorageBackend::write_batch
+        let batch_refs: Vec<(u64, &[u8])> = encrypted_ops
+            .iter()
+            .map(|(offset, data)| (*offset, data.as_slice()))
+            .collect();
+
+        let result = self.file.write_batch(&batch_refs);
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         }
@@ -205,12 +293,28 @@ impl PagedCachedFile {
         max_read_cache_bytes: usize,
         max_write_buffer_bytes: usize,
     ) -> Result<Self, DatabaseError> {
+        Self::new_with_crypto(file, page_size, max_read_cache_bytes, max_write_buffer_bytes, None)
+    }
+
+    pub(super) fn new_with_crypto(
+        file: Box<dyn StorageBackend>,
+        page_size: u64,
+        max_read_cache_bytes: usize,
+        max_write_buffer_bytes: usize,
+        crypto: Option<Arc<dyn PageCrypto>>,
+    ) -> Result<Self, DatabaseError> {
         let read_cache = (0..Self::lock_stripes())
             .map(|_| RwLock::new(LRUCache::new()))
             .collect();
 
+        let checked_backend = if let Some(c) = crypto {
+            CheckedBackend::with_crypto(file, page_size as usize, c)
+        } else {
+            CheckedBackend::new(file, page_size as usize)
+        };
+
         Ok(Self {
-            file: CheckedBackend::new(file),
+            file: checked_backend,
             page_size,
             max_read_cache_bytes,
             read_cache_bytes: AtomicUsize::new(0),
@@ -256,9 +360,16 @@ impl PagedCachedFile {
     fn flush_write_buffer(&self) -> Result {
         let mut write_buffer = self.write_buffer.lock().unwrap();
 
-        for (offset, buffer) in write_buffer.cache.iter() {
-            self.file.write(*offset, buffer.as_ref().unwrap())?;
-        }
+        // Collect all writes for batch operation
+        let batch_ops: Vec<(u64, Arc<[u8]>)> = write_buffer
+            .cache
+            .iter()
+            .map(|(offset, buffer)| (*offset, buffer.as_ref().unwrap().clone()))
+            .collect();
+
+        // Batch write all pages (uses io_uring on Linux if available)
+        self.file.write_batch(&batch_ops)?;
+
         for (offset, buffer) in write_buffer.cache.iter_mut() {
             let buffer = buffer.take().unwrap();
             let cache_size = self

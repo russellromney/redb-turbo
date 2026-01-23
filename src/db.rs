@@ -1,3 +1,4 @@
+use crate::page_crypto::PageCrypto;
 use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
 use crate::tree_store::{
     AllPageNumbersBtreeIter, BtreeHeader, BtreeRangeIter, FreedPageList, FreedTableKey,
@@ -54,6 +55,16 @@ pub trait StorageBackend: 'static + Debug + Send + Sync {
 
     /// Writes the specified array to the storage.
     fn write(&self, offset: u64, data: &[u8]) -> std::result::Result<(), io::Error>;
+
+    /// Batch write multiple pages at different offsets.
+    /// Default implementation calls write() sequentially.
+    /// Implementations may override for better performance (e.g., io_uring).
+    fn write_batch(&self, ops: &[(u64, &[u8])]) -> std::result::Result<(), io::Error> {
+        for (offset, data) in ops {
+            self.write(*offset, data)?;
+        }
+        Ok(())
+    }
 }
 
 pub trait TableHandle: Sealed {
@@ -877,6 +888,7 @@ impl Database {
         write_cache_size_bytes: usize,
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
         default_to_file_format_v3: bool,
+        crypto: Option<Arc<dyn PageCrypto>>,
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
@@ -890,6 +902,7 @@ impl Database {
             read_cache_size_bytes,
             write_cache_size_bytes,
             default_to_file_format_v3,
+            crypto,
         )?;
         let mut mem = Arc::new(mem);
         // TODO: Seems like there should be a better way to structure this. We have a file format
@@ -1113,6 +1126,7 @@ pub struct Builder {
     write_cache_size_bytes: usize,
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
     default_to_file_format_v3: bool,
+    crypto: Option<Arc<dyn PageCrypto>>,
 }
 
 impl Builder {
@@ -1135,10 +1149,39 @@ impl Builder {
             write_cache_size_bytes: 0,
             repair_callback: Box::new(|_| {}),
             default_to_file_format_v3: false,
+            crypto: None,
         };
 
         result.set_cache_size(1024 * 1024 * 1024);
         result
+    }
+
+    /// Set the page-level encryption/compression provider.
+    ///
+    /// When set, all database pages (except the header) will be processed
+    /// through the crypto provider before being written to disk.
+    ///
+    /// # Example with encryption feature enabled
+    /// ```ignore
+    /// use redb::{Builder, Aes256GcmPageCrypto};
+    ///
+    /// let key = [0u8; 32]; // Your encryption key
+    /// let crypto = Aes256GcmPageCrypto::new(&key, true, true);
+    /// let db = Builder::new()
+    ///     .set_page_crypto(crypto)
+    ///     .create("encrypted.redb")?;
+    /// ```
+    pub fn set_page_crypto(&mut self, crypto: impl PageCrypto) -> &mut Self {
+        self.crypto = Some(Arc::new(crypto));
+        self
+    }
+
+    /// Set the page-level encryption/compression provider from an Arc.
+    ///
+    /// Use this if you need to share the crypto provider across multiple databases.
+    pub fn set_page_crypto_arc(&mut self, crypto: Arc<dyn PageCrypto>) -> &mut Self {
+        self.crypto = Some(crypto);
+        self
     }
 
     /// Create new databases in the v3 file format
@@ -1216,6 +1259,7 @@ impl Builder {
             self.write_cache_size_bytes,
             &self.repair_callback,
             self.default_to_file_format_v3,
+            self.crypto.clone(),
         )
     }
 
@@ -1232,6 +1276,7 @@ impl Builder {
             self.write_cache_size_bytes,
             &self.repair_callback,
             self.default_to_file_format_v3,
+            self.crypto.clone(),
         )
     }
 
@@ -1248,6 +1293,7 @@ impl Builder {
             self.write_cache_size_bytes,
             &self.repair_callback,
             self.default_to_file_format_v3,
+            self.crypto.clone(),
         )
     }
 
@@ -1265,6 +1311,7 @@ impl Builder {
             self.write_cache_size_bytes,
             &self.repair_callback,
             self.default_to_file_format_v3,
+            self.crypto.clone(),
         )
     }
 }

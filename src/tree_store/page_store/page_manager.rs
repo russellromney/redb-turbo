@@ -126,6 +126,7 @@ impl TransactionalMemory {
         read_cache_size_bytes: usize,
         write_cache_size_bytes: usize,
         default_to_file_format_v3: bool,
+        crypto: Option<std::sync::Arc<dyn crate::page_crypto::PageCrypto>>,
     ) -> Result<Self, DatabaseError> {
         assert!(page_size.is_power_of_two() && page_size >= DB_HEADER_SIZE);
 
@@ -136,11 +137,12 @@ impl TransactionalMemory {
         );
         assert!(region_size.is_power_of_two());
 
-        let storage = PagedCachedFile::new(
+        let storage = PagedCachedFile::new_with_crypto(
             file,
             page_size as u64,
             read_cache_size_bytes,
             write_cache_size_bytes,
+            crypto,
         )?;
 
         let initial_storage_len = storage.raw_file_len()?;

@@ -21,8 +21,15 @@ pyo3-build-config = { version = "0.24.1", optional = true }
 log = { version = "0.4.17", optional = true }
 pyo3 = { version = "0.24.1", features=["extension-module", "abi3-py37"], optional = true }
 
+# Encryption (optional feature)
+aes-gcm = { version = "0.10", optional = true }
+zstd = { version = "0.13", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.104"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.4"
 
 # Common test/bench dependencies
 [dev-dependencies]
@@ -52,8 +59,6 @@ fjall = "=2.10"
 comfy-table = "7.0.1"
 env_logger = "0.11"
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-io-uring = "0.7.4"
 
 [features]
 # This feature is still experimental, and is not considered stable
@@ -62,6 +67,8 @@ python = ["dep:pyo3", "dep:pyo3-build-config"]
 logging = ["dep:log"]
 # Enable cache hit metrics
 cache_metrics = []
+# Enable page-level encryption and compression
+encryption = ["dep:aes-gcm", "dep:zstd"]
 
 [profile.bench]
 debug = true
