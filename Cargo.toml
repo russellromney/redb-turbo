@@ -104,3 +104,7 @@ harness = false
 [[bench]]
 name = "syscall_benchmark"
 harness = false
+
+[[bench]]
+name = "concurrent_writes_benchmark"
+harness = false
