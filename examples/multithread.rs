@@ -1,3 +1,4 @@
+use redb_turbo as redb;
 use redb::TableHandle;
 use redb::{Database, Error, TableDefinition};
 use std::time::Instant;

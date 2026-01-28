@@ -1,4 +1,5 @@
 use rand::random;
+use redb_turbo as redb;
 use redb::backends::InMemoryBackend;
 use redb::{
     Database, Key, MultimapTableDefinition, MultimapTableHandle, Range, ReadableTable,

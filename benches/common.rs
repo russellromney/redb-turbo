@@ -1,4 +1,5 @@
 use heed::{CompactionOption, EnvInfo};
+use redb_turbo as redb;
 use redb::{AccessGuard, ReadableTableMetadata, TableDefinition};
 use rocksdb::{
     Direction, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, WriteOptions,

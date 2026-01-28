@@ -1,5 +1,6 @@
 #[cfg(not(target_os = "wasi"))]
 mod multithreading_test {
+    use redb_turbo as redb;
     use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
     use std::sync::Arc;
     use std::thread;

@@ -1,3 +1,4 @@
+use redb_turbo as redb;
 use redb::{DatabaseError, ReadableTableMetadata, UpgradeError};
 use redb1::ReadableTable as ReadableTable1;
 

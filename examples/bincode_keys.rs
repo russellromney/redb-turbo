@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 
 use bincode::{Decode, Encode, decode_from_slice, encode_to_vec};
+use redb_turbo as redb;
 use redb::{Database, Error, Key, Range, TableDefinition, TypeName, Value};
 
 #[derive(Debug, Decode, Encode, PartialEq, Eq, PartialOrd, Ord)]

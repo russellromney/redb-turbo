@@ -287,6 +287,7 @@ pub(super) struct PagedCachedFile {
 }
 
 impl PagedCachedFile {
+    #[allow(dead_code)] // Used in tests
     pub(super) fn new(
         file: Box<dyn StorageBackend>,
         page_size: u64,

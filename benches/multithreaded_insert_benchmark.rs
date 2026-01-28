@@ -4,6 +4,7 @@ use tempfile::NamedTempFile;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use redb_turbo as redb;
 use redb::{Database, ReadableTableMetadata, TableDefinition};
 use std::time::Instant;
 

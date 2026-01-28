@@ -1,4 +1,5 @@
 //! Example demonstrating encrypted database usage
+use redb_turbo as redb;
 use redb::{Aes256GcmPageCrypto, Database, ReadableTable, TableDefinition};
 
 const TABLE: TableDefinition<&str, &str> = TableDefinition::new("my_data");
@@ -7,8 +8,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create encryption key (in practice, derive from password or use KMS)
     let key = [0x42u8; 32];
 
-    // Create crypto provider with compression enabled, skip header page
-    let crypto = Aes256GcmPageCrypto::new(&key, true, true)
+    // Create crypto provider, skip header page
+    let crypto = Aes256GcmPageCrypto::new(&key, true)
         .with_skip_below_offset(4096); // Skip first page (header)
 
     let tmpfile = tempfile::NamedTempFile::new()?;
@@ -44,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Re-open with same key and verify data
-    let crypto2 = Aes256GcmPageCrypto::new(&key, true, true)
+    let crypto2 = Aes256GcmPageCrypto::new(&key, true)
         .with_skip_below_offset(4096);
 
     let db = Database::builder()

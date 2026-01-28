@@ -1,3 +1,4 @@
+use redb_turbo as redb;
 use redb::{
     Database, MultimapTableDefinition, ReadableMultimapTable, ReadableTableMetadata, TableError,
 };

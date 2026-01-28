@@ -1,5 +1,6 @@
 use rand::Rng;
 use rand::prelude::SliceRandom;
+use redb_turbo as redb;
 use redb::backends::FileBackend;
 use redb::{
     AccessGuard, Builder, CompactionError, Database, Durability, Key, MultimapRange,

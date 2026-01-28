@@ -7,15 +7,13 @@
 //   cargo bench --bench concurrent_benchmark
 //   cargo bench --bench concurrent_benchmark --features encryption
 
-use redb::{Database, TableDefinition};
+use redb_turbo as redb;
+use redb::{Database, TableDefinition, Aes256GcmPageCrypto};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
-
-#[cfg(feature = "encryption")]
-use redb::Aes256GcmPageCrypto;
 
 const TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("data");
 const THREAD_COUNTS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
@@ -24,7 +22,6 @@ const WRITES_PER_BATCH: usize = 1000;
 #[derive(Clone, Copy)]
 enum CryptoMode {
     Plain,
-    #[cfg(feature = "encryption")]
     Encrypted,
 }
 
@@ -32,7 +29,6 @@ impl std::fmt::Display for CryptoMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CryptoMode::Plain => write!(f, "Plain"),
-            #[cfg(feature = "encryption")]
             CryptoMode::Encrypted => write!(f, "Encrypted (AES-256-GCM, 28B overhead/page)"),
         }
     }
@@ -62,7 +58,6 @@ impl LatencyStats {
 fn create_database(path: &std::path::Path, mode: CryptoMode) -> Database {
     match mode {
         CryptoMode::Plain => Database::create(path).unwrap(),
-        #[cfg(feature = "encryption")]
         CryptoMode::Encrypted => {
             let key = [0x42u8; 32];
             let crypto = Aes256GcmPageCrypto::new(&key, true);
@@ -317,26 +312,13 @@ fn main() {
     println!("  • Value size: {} bytes", value_size);
     println!("  • Test duration: {:.1}s per test", duration);
     println!("  • Writes per batch: {}", WRITES_PER_BATCH);
-    #[cfg(feature = "encryption")]
     println!("  • Encryption overhead: {} bytes/page (~0.7%)", 28);
 
-    // Plain mode (always available)
+    // Plain mode
     run_benchmarks_for_mode(CryptoMode::Plain, num_entries, value_size, duration);
 
-    // Encrypted mode (only with encryption feature)
-    #[cfg(feature = "encryption")]
-    {
-        run_benchmarks_for_mode(CryptoMode::Encrypted, num_entries, value_size, duration);
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    {
-        println!("\n╔══════════════════════════════════════════════════════════════╗");
-        println!("║  Encryption tests skipped                                    ║");
-        println!("║  Run with: cargo bench --bench concurrent_benchmark          ║");
-        println!("║            --features encryption                             ║");
-        println!("╚══════════════════════════════════════════════════════════════╝");
-    }
+    // Encrypted mode
+    run_benchmarks_for_mode(CryptoMode::Encrypted, num_entries, value_size, duration);
 
     println!("\n════════════════════════════════════════════════════════════════");
     println!("                     Benchmark Complete!");

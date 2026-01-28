@@ -322,6 +322,7 @@ impl Drop for TransactionGuard {
 /// Basic usage:
 ///
 /// ```rust
+/// use redb_turbo as redb;
 /// use redb::*;
 /// # use tempfile::NamedTempFile;
 /// const TABLE: TableDefinition<u64, u64> = TableDefinition::new("my_data");

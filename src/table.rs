@@ -371,6 +371,7 @@ pub trait ReadableTable<K: Key + 'static, V: Value + 'static>: ReadableTableMeta
     ///
     /// Usage:
     /// ```rust
+    /// use redb_turbo as redb;
     /// use redb::*;
     /// # use tempfile::NamedTempFile;
     /// const TABLE: TableDefinition<&str, u64> = TableDefinition::new("my_data");

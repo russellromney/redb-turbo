@@ -4,6 +4,7 @@ use std::env::current_dir;
 use tempfile::NamedTempFile;
 
 use rand::Rng;
+use redb_turbo as redb;
 use redb::{Database, TableDefinition};
 use std::time::{Duration, Instant};
 

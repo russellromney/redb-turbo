@@ -3,6 +3,7 @@
 // Run with io_uring:    cargo bench --bench concurrent_writes_benchmark
 // Run without io_uring: REDB_DISABLE_IOURING=1 cargo bench --bench concurrent_writes_benchmark
 
+use redb_turbo as redb;
 use redb::{Database, TableDefinition};
 use std::sync::Arc;
 use std::thread;
