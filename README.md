@@ -159,7 +159,7 @@ Dictionary compression typically improves ratios by 20-50% for small blocks. Use
 
 ### Encryption
 
-We reserve 28 bytes per page for encryption overhead (~0.7% space for 4KB pages). This includes a 12-byte nonce derived from the page offset and a 16-byte authentication tag that detects tampering. The database header page is left unencrypted for bootstrapping.
+We reserve 28 bytes per page for encryption overhead (~0.7% space for 4KB pages). This includes a 12-byte random nonce generated per write and a 16-byte authentication tag that detects tampering. The database header page is left unencrypted for bootstrapping.
 
 ### Compression
 
