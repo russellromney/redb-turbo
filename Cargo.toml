@@ -1,6 +1,6 @@
 [package]
 name = "redb-turbo"
-description = "redb fork with AES-256-GCM encryption and zstd compression"
+description = "redb fork with AES-256-GCM page encryption"
 homepage = "https://github.com/russellromney/redb-turbo"
 repository = "https://github.com/russellromney/redb-turbo"
 readme = "README.md"
@@ -21,9 +21,8 @@ pyo3-build-config = { version = "0.24.1", optional = true }
 log = { version = "0.4.17", optional = true }
 pyo3 = { version = "0.24.1", features=["extension-module", "abi3-py37"], optional = true }
 
-# Encryption and compression (enabled by default)
+# Encryption
 aes-gcm = "0.10"
-zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.104"
