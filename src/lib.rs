@@ -111,8 +111,11 @@ mod tree_store;
 mod tuple_types;
 mod types;
 
-// Re-export page crypto types
-pub use page_crypto::{Aes256GcmPageCrypto, NoOpPageCrypto, PageCrypto};
+// Re-export page crypto and compression types
+pub use page_crypto::{
+    Aes256GcmPageCrypto, DictionaryTrainer, NoOpPageCompression, NoOpPageCrypto, PageCompression,
+    PageCrypto, ZstdDictPageCompression, ZstdPageCompression,
+};
 
 #[cfg(test)]
 fn create_tempfile() -> tempfile::NamedTempFile {

@@ -520,6 +520,7 @@ mod test {
                 0,
                 false,
                 None,
+                None,
             )
             .unwrap()
             .needs_repair()
@@ -614,6 +615,7 @@ mod test {
                 0,
                 false,
                 None,
+                None,
             )
             .unwrap()
             .needs_repair()
@@ -652,6 +654,7 @@ mod test {
                 0,
                 0,
                 false,
+                None,
                 None,
             )
             .unwrap()
@@ -713,6 +716,7 @@ mod test {
                 0,
                 0,
                 false,
+                None,
                 None,
             )
             .unwrap()

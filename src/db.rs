@@ -1,4 +1,4 @@
-use crate::page_crypto::PageCrypto;
+use crate::page_crypto::{PageCompression, PageCrypto};
 use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
 use crate::tree_store::{
     AllPageNumbersBtreeIter, BtreeHeader, BtreeRangeIter, FreedPageList, FreedTableKey,
@@ -890,6 +890,7 @@ impl Database {
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
         default_to_file_format_v3: bool,
         crypto: Option<Arc<dyn PageCrypto>>,
+        compression: Option<Arc<dyn PageCompression>>,
     ) -> Result<Self, DatabaseError> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
@@ -904,6 +905,7 @@ impl Database {
             write_cache_size_bytes,
             default_to_file_format_v3,
             crypto,
+            compression,
         )?;
         let mut mem = Arc::new(mem);
         // TODO: Seems like there should be a better way to structure this. We have a file format
@@ -1128,6 +1130,7 @@ pub struct Builder {
     repair_callback: Box<dyn Fn(&mut RepairSession)>,
     default_to_file_format_v3: bool,
     crypto: Option<Arc<dyn PageCrypto>>,
+    compression: Option<Arc<dyn PageCompression>>,
 }
 
 impl Builder {
@@ -1151,6 +1154,7 @@ impl Builder {
             repair_callback: Box::new(|_| {}),
             default_to_file_format_v3: false,
             crypto: None,
+            compression: None,
         };
 
         result.set_cache_size(1024 * 1024 * 1024);
@@ -1182,6 +1186,35 @@ impl Builder {
     /// Use this if you need to share the crypto provider across multiple databases.
     pub fn set_page_crypto_arc(&mut self, crypto: Arc<dyn PageCrypto>) -> &mut Self {
         self.crypto = Some(crypto);
+        self
+    }
+
+    /// Set the page-level compression provider.
+    ///
+    /// When set, all database pages (except the header) will be compressed
+    /// before being written to disk. If encryption is also set, compression
+    /// is applied first (compress then encrypt).
+    ///
+    /// # Example
+    /// ```ignore
+    /// use redb::{Builder, ZstdPageCompression};
+    ///
+    /// let compression = ZstdPageCompression::new(true)
+    ///     .with_skip_below_offset(4096);
+    /// let db = Builder::new()
+    ///     .set_page_compression(compression)
+    ///     .create("compressed.redb")?;
+    /// ```
+    pub fn set_page_compression(&mut self, compression: impl PageCompression) -> &mut Self {
+        self.compression = Some(Arc::new(compression));
+        self
+    }
+
+    /// Set the page-level compression provider from an Arc.
+    ///
+    /// Use this if you need to share the compression provider across multiple databases.
+    pub fn set_page_compression_arc(&mut self, compression: Arc<dyn PageCompression>) -> &mut Self {
+        self.compression = Some(compression);
         self
     }
 
@@ -1261,6 +1294,7 @@ impl Builder {
             &self.repair_callback,
             self.default_to_file_format_v3,
             self.crypto.clone(),
+            self.compression.clone(),
         )
     }
 
@@ -1278,6 +1312,7 @@ impl Builder {
             &self.repair_callback,
             self.default_to_file_format_v3,
             self.crypto.clone(),
+            self.compression.clone(),
         )
     }
 
@@ -1295,6 +1330,7 @@ impl Builder {
             &self.repair_callback,
             self.default_to_file_format_v3,
             self.crypto.clone(),
+            self.compression.clone(),
         )
     }
 
@@ -1313,6 +1349,7 @@ impl Builder {
             &self.repair_callback,
             self.default_to_file_format_v3,
             self.crypto.clone(),
+            self.compression.clone(),
         )
     }
 }

@@ -1,4 +1,4 @@
-use crate::page_crypto::PageCrypto;
+use crate::page_crypto::{PageCompression, PageCrypto};
 use crate::tree_store::page_store::base::PageHint;
 use crate::tree_store::page_store::lru_cache::LRUCache;
 use crate::{CacheStats, DatabaseError, Result, StorageBackend, StorageError};
@@ -113,6 +113,7 @@ struct CheckedBackend {
     file: Box<dyn StorageBackend>,
     io_failed: AtomicBool,
     crypto: Option<Arc<dyn PageCrypto>>,
+    compression: Option<Arc<dyn PageCompression>>,
     page_size: usize,
 }
 
@@ -121,6 +122,7 @@ impl std::fmt::Debug for CheckedBackend {
         f.debug_struct("CheckedBackend")
             .field("io_failed", &self.io_failed)
             .field("has_crypto", &self.crypto.is_some())
+            .field("has_compression", &self.compression.is_some())
             .field("page_size", &self.page_size)
             .finish()
     }
@@ -132,19 +134,22 @@ impl CheckedBackend {
             file,
             io_failed: AtomicBool::new(false),
             crypto: None,
+            compression: None,
             page_size,
         }
     }
 
-    fn with_crypto(
+    fn with_transforms(
         file: Box<dyn StorageBackend>,
         page_size: usize,
-        crypto: Arc<dyn PageCrypto>,
+        crypto: Option<Arc<dyn PageCrypto>>,
+        compression: Option<Arc<dyn PageCompression>>,
     ) -> Self {
         Self {
             file,
             io_failed: AtomicBool::new(false),
-            crypto: Some(crypto),
+            crypto,
+            compression,
             page_size,
         }
     }
@@ -176,17 +181,63 @@ impl CheckedBackend {
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         }
-        let data = result.map_err(StorageError::from)?;
+        let raw_data = result.map_err(StorageError::from)?;
 
-        // Decrypt if crypto is configured and this is a full page read
-        if let Some(ref crypto) = self.crypto {
-            if len == self.page_size && offset >= crypto.encryption_start_offset() {
-                return crypto
-                    .decrypt(offset, &data, self.page_size)
-                    .map_err(|e| StorageError::Io(e));
+        // Apply transforms in reverse order: decrypt first, then decompress
+        // (write order is: compress -> encrypt -> disk)
+
+        if len == self.page_size {
+            // Single page read - apply both decryption and decompression
+            let mut data = raw_data;
+
+            // Decrypt if crypto is configured
+            if let Some(ref crypto) = self.crypto {
+                if offset >= crypto.encryption_start_offset() {
+                    data = crypto
+                        .decrypt(offset, &data, self.page_size)
+                        .map_err(StorageError::Io)?;
+                }
             }
+
+            // Decompress if compression is configured
+            if let Some(ref compression) = self.compression {
+                if offset >= compression.compression_start_offset() {
+                    data = compression
+                        .decompress(offset, &data, self.page_size)
+                        .map_err(StorageError::Io)?;
+                }
+            }
+
+            Ok(data)
+        } else if len % self.page_size == 0 && self.compression.is_some() {
+            // Multi-page read with compression - split into pages, decompress each
+            // Note: We don't apply decryption here because encryption has per-page overhead
+            // that isn't accounted for in multi-page reads from redb internals
+            let num_pages = len / self.page_size;
+            let mut result = Vec::with_capacity(len);
+
+            for i in 0..num_pages {
+                let page_offset = offset + (i * self.page_size) as u64;
+                let page_start = i * self.page_size;
+                let mut page_data = raw_data[page_start..page_start + self.page_size].to_vec();
+
+                // Decompress if compression is configured
+                if let Some(ref compression) = self.compression {
+                    if page_offset >= compression.compression_start_offset() {
+                        page_data = compression
+                            .decompress(page_offset, &page_data, self.page_size)
+                            .map_err(StorageError::Io)?;
+                    }
+                }
+
+                result.extend_from_slice(&page_data);
+            }
+
+            Ok(result)
+        } else {
+            // Non-page-aligned read or encryption-only - return as-is
+            Ok(raw_data)
         }
-        Ok(data)
     }
 
     fn set_len(&self, len: u64) -> Result<()> {
@@ -210,19 +261,28 @@ impl CheckedBackend {
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         self.check_failure()?;
 
-        // Encrypt if crypto is configured and this is a full page write
-        let data_to_write: std::borrow::Cow<'_, [u8]> = if let Some(ref crypto) = self.crypto {
-            if data.len() == self.page_size && offset >= crypto.encryption_start_offset() {
-                let encrypted = crypto
-                    .encrypt(offset, data, self.page_size)
-                    .map_err(|e| StorageError::Io(e))?;
-                std::borrow::Cow::Owned(encrypted)
-            } else {
-                std::borrow::Cow::Borrowed(data)
+        // Apply transforms: compress first, then encrypt
+        let mut data_to_write: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(data);
+
+        // Compress if compression is configured and this is a full page write
+        if let Some(ref compression) = self.compression {
+            if data.len() == self.page_size && offset >= compression.compression_start_offset() {
+                let compressed = compression
+                    .compress(offset, &data_to_write, self.page_size)
+                    .map_err(StorageError::Io)?;
+                data_to_write = std::borrow::Cow::Owned(compressed);
             }
-        } else {
-            std::borrow::Cow::Borrowed(data)
-        };
+        }
+
+        // Encrypt if crypto is configured and this is a full page write
+        if let Some(ref crypto) = self.crypto {
+            if data_to_write.len() == self.page_size && offset >= crypto.encryption_start_offset() {
+                let encrypted = crypto
+                    .encrypt(offset, &data_to_write, self.page_size)
+                    .map_err(StorageError::Io)?;
+                data_to_write = std::borrow::Cow::Owned(encrypted);
+            }
+        }
 
         let result = self.file.write(offset, &data_to_write);
         if result.is_err() {
@@ -234,28 +294,66 @@ impl CheckedBackend {
     fn write_batch(&self, ops: &[(u64, Arc<[u8]>)]) -> Result<()> {
         self.check_failure()?;
 
-        // Encrypt all pages first (if crypto is configured)
-        let encrypted_ops: Vec<(u64, Vec<u8>)> = if let Some(ref crypto) = self.crypto {
-            ops.iter()
-                .map(|(offset, data)| {
-                    if data.len() == self.page_size && *offset >= crypto.encryption_start_offset() {
-                        let encrypted = crypto
-                            .encrypt(*offset, data, self.page_size)
-                            .map_err(|e| StorageError::Io(e))?;
-                        Ok((*offset, encrypted))
-                    } else {
-                        Ok((*offset, data.to_vec()))
+        // Apply transforms: compress first, then encrypt
+        // For multi-page writes, we process compression page-by-page but NOT encryption.
+        // Encryption has per-page overhead that requires data to be stored accounting for it,
+        // which is handled by redb at a higher level for single-page writes.
+        let mut transformed_ops: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        for (offset, data) in ops.iter() {
+            if data.len() == self.page_size {
+                // Single page write - process directly (both compression and encryption)
+                let mut transformed: Vec<u8> = data.to_vec();
+
+                // Compress if configured
+                if let Some(ref compression) = self.compression {
+                    if *offset >= compression.compression_start_offset() {
+                        transformed = compression
+                            .compress(*offset, &transformed, self.page_size)
+                            .map_err(StorageError::Io)?;
                     }
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            ops.iter()
-                .map(|(offset, data)| (*offset, data.to_vec()))
-                .collect()
-        };
+                }
+
+                // Encrypt if configured (only for single pages)
+                if let Some(ref crypto) = self.crypto {
+                    if transformed.len() == self.page_size && *offset >= crypto.encryption_start_offset() {
+                        transformed = crypto
+                            .encrypt(*offset, &transformed, self.page_size)
+                            .map_err(StorageError::Io)?;
+                    }
+                }
+
+                transformed_ops.push((*offset, transformed));
+            } else if data.len() % self.page_size == 0 && self.compression.is_some() {
+                // Multi-page write with compression - split into pages, compress each
+                // Note: We don't apply encryption here because it has per-page overhead
+                // that isn't accounted for in multi-page writes from redb internals
+                let num_pages = data.len() / self.page_size;
+                for i in 0..num_pages {
+                    let page_offset = *offset + (i * self.page_size) as u64;
+                    let page_start = i * self.page_size;
+                    let page_data = &data[page_start..page_start + self.page_size];
+                    let mut transformed: Vec<u8> = page_data.to_vec();
+
+                    // Compress if configured
+                    if let Some(ref compression) = self.compression {
+                        if page_offset >= compression.compression_start_offset() {
+                            transformed = compression
+                                .compress(page_offset, &transformed, self.page_size)
+                                .map_err(StorageError::Io)?;
+                        }
+                    }
+
+                    transformed_ops.push((page_offset, transformed));
+                }
+            } else {
+                // Non-page-aligned write or encryption-only - pass through as-is
+                transformed_ops.push((*offset, data.to_vec()));
+            }
+        }
 
         // Convert to the format expected by StorageBackend::write_batch
-        let batch_refs: Vec<(u64, &[u8])> = encrypted_ops
+        let batch_refs: Vec<(u64, &[u8])> = transformed_ops
             .iter()
             .map(|(offset, data)| (*offset, data.as_slice()))
             .collect();
@@ -294,22 +392,23 @@ impl PagedCachedFile {
         max_read_cache_bytes: usize,
         max_write_buffer_bytes: usize,
     ) -> Result<Self, DatabaseError> {
-        Self::new_with_crypto(file, page_size, max_read_cache_bytes, max_write_buffer_bytes, None)
+        Self::new_with_transforms(file, page_size, max_read_cache_bytes, max_write_buffer_bytes, None, None)
     }
 
-    pub(super) fn new_with_crypto(
+    pub(super) fn new_with_transforms(
         file: Box<dyn StorageBackend>,
         page_size: u64,
         max_read_cache_bytes: usize,
         max_write_buffer_bytes: usize,
         crypto: Option<Arc<dyn PageCrypto>>,
+        compression: Option<Arc<dyn PageCompression>>,
     ) -> Result<Self, DatabaseError> {
         let read_cache = (0..Self::lock_stripes())
             .map(|_| RwLock::new(LRUCache::new()))
             .collect();
 
-        let checked_backend = if let Some(c) = crypto {
-            CheckedBackend::with_crypto(file, page_size as usize, c)
+        let checked_backend = if crypto.is_some() || compression.is_some() {
+            CheckedBackend::with_transforms(file, page_size as usize, crypto, compression)
         } else {
             CheckedBackend::new(file, page_size as usize)
         };

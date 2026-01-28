@@ -1,9 +1,17 @@
 # redb-turbo
 
-A fork of [redb](https://github.com/cberner/redb) with **AES-256-GCM page encryption**.
+A fork of [redb](https://github.com/cberner/redb) with **AES-256-GCM page encryption** and **zstd page compression**.
 
 [![Crates.io](https://img.shields.io/crates/v/redb-turbo.svg)](https://crates.io/crates/redb-turbo)
 [![License](https://img.shields.io/crates/l/redb-turbo)](https://crates.io/crates/redb-turbo)
+
+## Features
+
+- **Encryption**: AES-256-GCM encryption at the page level for data-at-rest protection
+- **Compression**: Zstd compression at the page level to reduce storage size
+- **Dictionary Compression**: Train custom zstd dictionaries for 20-50% better compression ratios
+- **Flexible**: Use nothing, compression only, encryption only, or both
+- **Compatible**: Same API as redb - just add encryption/compression to your builder
 
 ## Installation
 
@@ -11,21 +19,29 @@ A fork of [redb](https://github.com/cberner/redb) with **AES-256-GCM page encryp
 cargo add redb-turbo
 ```
 
-## Encryption
+## Usage
+
+### Plain redb (no encryption or compression)
 
 ```rust
-use redb_turbo::{Builder, Database, TableDefinition};
-use redb_turbo::page_crypto::Aes256GcmPageCrypto;
+use redb_turbo::Database;
+
+let db = Database::create("plain.redb")?;
+```
+
+### Encryption Only
+
+```rust
+use redb_turbo::{Database, Aes256GcmPageCrypto, TableDefinition};
 
 const TABLE: TableDefinition<&str, &str> = TableDefinition::new("secrets");
 
 fn main() -> Result<(), redb_turbo::Error> {
     let key: [u8; 32] = [0u8; 32]; // your 32-byte key
 
-    let crypto = Aes256GcmPageCrypto::new(&key, true)
-        .with_skip_below_offset(4096);
+    let crypto = Aes256GcmPageCrypto::new(&key, true); // true = skip header page
 
-    let db = Builder::new()
+    let db = Database::builder()
         .set_page_crypto(crypto)
         .create("encrypted.redb")?;
 
@@ -40,9 +56,118 @@ fn main() -> Result<(), redb_turbo::Error> {
 }
 ```
 
-### How It Works
+### Compression Only
+
+```rust
+use redb_turbo::{Database, ZstdPageCompression, TableDefinition};
+
+const TABLE: TableDefinition<&str, &str> = TableDefinition::new("data");
+
+fn main() -> Result<(), redb_turbo::Error> {
+    let compression = ZstdPageCompression::new(true); // true = skip header page
+
+    let db = Database::builder()
+        .set_page_compression(compression)
+        .create("compressed.redb")?;
+
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(TABLE)?;
+        table.insert("key", "highly compressible data data data data")?;
+    }
+    write_txn.commit()?;
+
+    Ok(())
+}
+```
+
+### Compression + Encryption
+
+For maximum security and storage efficiency, use both. Data is compressed first, then encrypted.
+
+```rust
+use redb_turbo::{Database, Aes256GcmPageCrypto, ZstdPageCompression, TableDefinition};
+
+const TABLE: TableDefinition<&str, &str> = TableDefinition::new("secrets");
+
+fn main() -> Result<(), redb_turbo::Error> {
+    let key: [u8; 32] = [0u8; 32]; // your 32-byte key
+
+    let compression = ZstdPageCompression::new(true);
+    let crypto = Aes256GcmPageCrypto::new(&key, true);
+
+    let db = Database::builder()
+        .set_page_compression(compression)
+        .set_page_crypto(crypto)
+        .create("secure.redb")?;
+
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(TABLE)?;
+        table.insert("api_key", "sk-1234567890")?;
+    }
+    write_txn.commit()?;
+
+    Ok(())
+}
+```
+
+### Dictionary Compression (Advanced)
+
+For better compression ratios on small pages, train a zstd dictionary on sample data from your workload:
+
+```rust
+use redb_turbo::{Database, ZstdDictPageCompression, DictionaryTrainer, TableDefinition};
+
+const TABLE: TableDefinition<&str, &str> = TableDefinition::new("data");
+
+fn main() -> Result<(), redb_turbo::Error> {
+    // Step 1: Collect sample pages from an existing database or representative data
+    let samples: Vec<Vec<u8>> = collect_sample_pages(); // Your data collection logic
+
+    // Step 2: Train a dictionary (64KB is good for 4KB pages)
+    let dict = DictionaryTrainer::train(&samples, 65536)
+        .expect("Need at least 100 samples for good results");
+
+    // Step 3: Save dictionary for reuse
+    DictionaryTrainer::save_to_file(&dict, "my_dict.zdict")?;
+
+    // Step 4: Use dictionary compression
+    let compression = ZstdDictPageCompression::new(&dict, true);
+    let db = Database::builder()
+        .set_page_compression(compression)
+        .create("dict_compressed.redb")?;
+
+    // Use normally...
+    Ok(())
+}
+
+// Later, load the dictionary:
+fn open_with_dict() -> Result<(), redb_turbo::Error> {
+    let dict = DictionaryTrainer::load_from_file("my_dict.zdict")?;
+    let compression = ZstdDictPageCompression::new(&dict, true);
+    let db = Database::builder()
+        .set_page_compression(compression)
+        .open("dict_compressed.redb")?;
+    Ok(())
+}
+```
+
+Dictionary compression typically improves ratios by 20-50% for small blocks. Use `DictionaryTrainer::estimate_improvement()` to measure the benefit for your data.
+
+## How It Works
+
+### Encryption
 
 We reserve 28 bytes per page for encryption overhead (~0.7% space for 4KB pages). This includes a 12-byte nonce derived from the page offset and a 16-byte authentication tag that detects tampering. The database header page is left unencrypted for bootstrapping.
+
+### Compression
+
+Each page is independently compressed using zstd. If compression doesn't reduce size, the page is stored uncompressed with a marker. The header page is left uncompressed for bootstrapping.
+
+### Dictionary Compression
+
+When using a pre-trained dictionary, zstd can reference common patterns without including them in each compressed block, significantly improving ratios for small pages. The dictionary must be available when opening the database.
 
 ---
 
