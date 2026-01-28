@@ -209,10 +209,8 @@ impl CheckedBackend {
             }
 
             Ok(data)
-        } else if len % self.page_size == 0 && self.compression.is_some() {
-            // Multi-page read with compression - split into pages, decompress each
-            // Note: We don't apply decryption here because encryption has per-page overhead
-            // that isn't accounted for in multi-page reads from redb internals
+        } else if len % self.page_size == 0 && (self.compression.is_some() || self.crypto.is_some()) {
+            // Multi-page read with compression/encryption - process page-by-page
             let num_pages = len / self.page_size;
             let mut result = Vec::with_capacity(len);
 
@@ -221,7 +219,16 @@ impl CheckedBackend {
                 let page_start = i * self.page_size;
                 let mut page_data = raw_data[page_start..page_start + self.page_size].to_vec();
 
-                // Decompress if compression is configured
+                // Decrypt first (reverse of write order: compress -> encrypt)
+                if let Some(ref crypto) = self.crypto {
+                    if page_offset >= crypto.encryption_start_offset() {
+                        page_data = crypto
+                            .decrypt(page_offset, &page_data, self.page_size)
+                            .map_err(StorageError::Io)?;
+                    }
+                }
+
+                // Then decompress
                 if let Some(ref compression) = self.compression {
                     if page_offset >= compression.compression_start_offset() {
                         page_data = compression
@@ -235,7 +242,7 @@ impl CheckedBackend {
 
             Ok(result)
         } else {
-            // Non-page-aligned read or encryption-only - return as-is
+            // Non-page-aligned read - return as-is
             Ok(raw_data)
         }
     }
@@ -324,10 +331,8 @@ impl CheckedBackend {
                 }
 
                 transformed_ops.push((*offset, transformed));
-            } else if data.len() % self.page_size == 0 && self.compression.is_some() {
-                // Multi-page write with compression - split into pages, compress each
-                // Note: We don't apply encryption here because it has per-page overhead
-                // that isn't accounted for in multi-page writes from redb internals
+            } else if data.len() % self.page_size == 0 && (self.compression.is_some() || self.crypto.is_some()) {
+                // Multi-page write with compression/encryption - process page-by-page
                 let num_pages = data.len() / self.page_size;
                 for i in 0..num_pages {
                     let page_offset = *offset + (i * self.page_size) as u64;
@@ -335,7 +340,7 @@ impl CheckedBackend {
                     let page_data = &data[page_start..page_start + self.page_size];
                     let mut transformed: Vec<u8> = page_data.to_vec();
 
-                    // Compress if configured
+                    // Compress first
                     if let Some(ref compression) = self.compression {
                         if page_offset >= compression.compression_start_offset() {
                             transformed = compression
@@ -344,10 +349,19 @@ impl CheckedBackend {
                         }
                     }
 
+                    // Then encrypt
+                    if let Some(ref crypto) = self.crypto {
+                        if transformed.len() == self.page_size && page_offset >= crypto.encryption_start_offset() {
+                            transformed = crypto
+                                .encrypt(page_offset, &transformed, self.page_size)
+                                .map_err(StorageError::Io)?;
+                        }
+                    }
+
                     transformed_ops.push((page_offset, transformed));
                 }
             } else {
-                // Non-page-aligned write or encryption-only - pass through as-is
+                // Non-page-aligned write - pass through as-is
                 transformed_ops.push((*offset, data.to_vec()));
             }
         }
