@@ -23,3 +23,6 @@ flamegraph.svg
 
 # benchmark and test temporary files
 /.tmp*
+
+# Development files
+CLAUDE.md
