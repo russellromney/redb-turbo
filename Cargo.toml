@@ -1,14 +1,14 @@
 [package]
-name = "redb"
-description = "Rust Embedded DataBase"
-homepage = "https://www.redb.org"
-repository = "https://github.com/cberner/redb"
+name = "redb-turbo"
+description = "redb fork with AES-256-GCM encryption and zstd compression"
+homepage = "https://github.com/russellromney/redb-turbo"
+repository = "https://github.com/russellromney/redb-turbo"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-version = "2.6.3"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-authors = ["Christopher Berner <me@cberner.com>"]
+authors = ["Russell Romney"]
 exclude = ["fuzz/"]
 
 [lib]
@@ -21,15 +21,12 @@ pyo3-build-config = { version = "0.24.1", optional = true }
 log = { version = "0.4.17", optional = true }
 pyo3 = { version = "0.24.1", features=["extension-module", "abi3-py37"], optional = true }
 
-# Encryption (optional feature)
-aes-gcm = { version = "0.10", optional = true }
-zstd = { version = "0.13", optional = true }
+# Encryption and compression (enabled by default)
+aes-gcm = "0.10"
+zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.104"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7.4"
 
 # Common test/bench dependencies
 [dev-dependencies]
@@ -67,8 +64,6 @@ python = ["dep:pyo3", "dep:pyo3-build-config"]
 logging = ["dep:log"]
 # Enable cache hit metrics
 cache_metrics = []
-# Enable page-level encryption and compression
-encryption = ["dep:aes-gcm", "dep:zstd"]
 
 [profile.bench]
 debug = true
@@ -107,4 +102,8 @@ harness = false
 
 [[bench]]
 name = "concurrent_writes_benchmark"
+harness = false
+
+[[bench]]
+name = "concurrent_benchmark"
 harness = false

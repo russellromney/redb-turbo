@@ -1,27 +1,25 @@
-//! Page-level encryption and compression for redb.
+//! Page-level encryption for redb.
 //!
-//! This module provides transparent encryption and compression of database pages.
-//! Order of operations:
-//! - Write: compress -> encrypt -> disk
-//! - Read: disk -> decrypt -> decompress
+//! This module provides transparent AES-256-GCM encryption of database pages.
+//! Each encrypted page reserves space for the nonce and authentication tag.
 //!
-//! Supports optional zstd dictionary for improved compression ratios.
+//! Page format:
+//! ```text
+//! [nonce: 12 bytes][ciphertext: page_size - 28][tag: 16 bytes]
+//! ```
+//!
+//! Overhead: 28 bytes per page (~0.7% for 4KB pages)
 //! The first page (header) is NOT encrypted to allow bootstrapping.
 
 use std::fmt::Debug;
 use std::io;
-use std::sync::Arc;
 
-#[cfg(feature = "encryption")]
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 
-#[cfg(feature = "encryption")]
-use zstd::dict::{DecoderDictionary, EncoderDictionary};
-
-/// Trait for page-level encryption and compression.
+/// Trait for page-level encryption.
 ///
 /// Implementations must be thread-safe and handle fixed-size pages.
 /// The header page (offset 0) is typically not encrypted.
@@ -41,126 +39,62 @@ pub trait PageCrypto: Send + Sync + Debug + 'static {
     /// - `data`: encrypted page data from disk, length == page_size
     /// - `page_size`: the database page size
     ///
-    /// Returns decrypted/decompressed data. Length MUST equal page_size.
+    /// Returns decrypted data. Length MUST equal page_size.
     fn decrypt(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>>;
 
     /// Returns the byte offset where encryption starts.
     /// Typically this is the page_size (skip header page).
     fn encryption_start_offset(&self) -> u64 {
-        0 // Subclasses can override to skip header
+        0
+    }
+
+    /// Returns the number of bytes reserved per page for encryption overhead.
+    /// The usable space per page is (page_size - overhead()).
+    /// Default is 0 (no overhead).
+    fn overhead(&self) -> usize {
+        0
     }
 }
 
-/// Page header for encrypted/compressed pages.
-/// Stored at the beginning of each encrypted page.
-#[cfg(feature = "encryption")]
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct PageHeader {
-    /// Ciphertext length (including GCM tag)
-    ciphertext_len: u32,
-    /// Flags: bit 0 = compressed
-    flags: u8,
-    /// Reserved for future use
-    _reserved: [u8; 3],
-    /// AES-GCM nonce (12 bytes)
-    nonce: [u8; 12],
-}
-
-#[cfg(feature = "encryption")]
-impl PageHeader {
-    const SIZE: usize = 20; // 4 + 1 + 3 + 12
-
-    fn to_bytes(&self) -> [u8; Self::SIZE] {
-        let mut bytes = [0u8; Self::SIZE];
-        bytes[0..4].copy_from_slice(&self.ciphertext_len.to_le_bytes());
-        bytes[4] = self.flags;
-        // bytes[5..8] reserved
-        bytes[8..20].copy_from_slice(&self.nonce);
-        bytes
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut ciphertext_len_bytes = [0u8; 4];
-        ciphertext_len_bytes.copy_from_slice(&bytes[0..4]);
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&bytes[8..20]);
-
-        Self {
-            ciphertext_len: u32::from_le_bytes(ciphertext_len_bytes),
-            flags: bytes[4],
-            _reserved: [0; 3],
-            nonce,
-        }
-    }
-
-    fn is_compressed(&self) -> bool {
-        self.flags & 0x01 != 0
-    }
-}
-
-/// AES-256-GCM encryption with optional zstd compression.
+/// AES-256-GCM page encryption.
 ///
 /// Page format:
 /// ```text
-/// [PageHeader: 20 bytes][Encrypted data][Padding to page_size]
+/// [nonce: 12 bytes][ciphertext: page_size - 28][tag: 16 bytes]
 /// ```
 ///
-/// The encrypted data contains:
-/// - If compressed: zstd compressed original data + 16-byte GCM tag
-/// - If not compressed: original data + 16-byte GCM tag
-///
-/// Supports pre-trained zstd dictionaries for improved compression ratios.
-#[cfg(feature = "encryption")]
+/// The nonce is derived deterministically from the page offset.
+/// Overhead: 28 bytes per page (12 nonce + 16 auth tag).
 pub struct Aes256GcmPageCrypto {
     cipher: Aes256Gcm,
-    compress: bool,
-    compression_level: i32,
-    /// Skip encryption for offsets below this value (header pages)
     skip_below_offset: u64,
-    /// Pre-trained zstd compression dictionary (optional)
-    encoder_dict: Option<Arc<EncoderDictionary<'static>>>,
-    /// Pre-trained zstd decompression dictionary (optional)
-    decoder_dict: Option<Arc<DecoderDictionary<'static>>>,
 }
 
-#[cfg(feature = "encryption")]
 impl Debug for Aes256GcmPageCrypto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Aes256GcmPageCrypto")
-            .field("compress", &self.compress)
-            .field("compression_level", &self.compression_level)
             .field("skip_below_offset", &self.skip_below_offset)
-            .field("has_dictionary", &self.encoder_dict.is_some())
             .finish_non_exhaustive()
     }
 }
 
-#[cfg(feature = "encryption")]
 impl Aes256GcmPageCrypto {
+    /// Nonce size for AES-GCM
+    const NONCE_SIZE: usize = 12;
     /// GCM authentication tag size
     const TAG_SIZE: usize = 16;
+    /// Total overhead per page
+    pub const OVERHEAD: usize = Self::NONCE_SIZE + Self::TAG_SIZE; // 28 bytes
 
     /// Create a new AES-256-GCM page crypto with the given 32-byte key.
     ///
     /// - `key`: 32-byte encryption key
-    /// - `compress`: enable zstd compression before encryption
     /// - `skip_header`: if true, skip encrypting the first page (offset < page_size)
-    pub fn new(key: &[u8; 32], compress: bool, skip_header: bool) -> Self {
+    pub fn new(key: &[u8; 32], skip_header: bool) -> Self {
         Self {
             cipher: Aes256Gcm::new(key.into()),
-            compress,
-            compression_level: 3, // zstd default
-            skip_below_offset: if skip_header { u64::MAX } else { 0 }, // Set properly later
-            encoder_dict: None,
-            decoder_dict: None,
+            skip_below_offset: if skip_header { u64::MAX } else { 0 },
         }
-    }
-
-    /// Create with custom compression level (1-22, default 3).
-    pub fn with_compression_level(mut self, level: i32) -> Self {
-        self.compression_level = level.clamp(1, 22);
-        self
     }
 
     /// Set the offset below which encryption is skipped.
@@ -170,202 +104,85 @@ impl Aes256GcmPageCrypto {
         self
     }
 
-    /// Set a pre-trained zstd dictionary for improved compression.
-    ///
-    /// The dictionary should be trained on representative database pages.
-    /// Use `train_dictionary()` to create one from sample pages.
-    pub fn with_dictionary(mut self, dict_data: &[u8]) -> Self {
-        // Create encoder dictionary at the configured compression level
-        let encoder_dict = EncoderDictionary::copy(dict_data, self.compression_level);
-        self.encoder_dict = Some(Arc::new(encoder_dict));
-
-        // Create decoder dictionary
-        let decoder_dict = DecoderDictionary::copy(dict_data);
-        self.decoder_dict = Some(Arc::new(decoder_dict));
-
-        self
-    }
-
-    /// Train a zstd dictionary from sample pages.
-    ///
-    /// - `samples`: Collection of raw page data to train on
-    /// - `dict_size`: Target dictionary size in bytes (recommended: 16KB-112KB)
-    ///
-    /// Returns the trained dictionary bytes which can be saved to a file
-    /// and later loaded with `with_dictionary()`.
-    pub fn train_dictionary(samples: &[Vec<u8>], dict_size: usize) -> io::Result<Vec<u8>> {
-        // Collect all samples as references
-        let sample_refs: Vec<&[u8]> = samples.iter().map(|s| s.as_slice()).collect();
-
-        zstd::dict::from_samples(&sample_refs, dict_size)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Dictionary training failed: {}", e)))
-    }
-
     /// Derive a deterministic nonce from the page offset.
-    /// Uses the offset as the primary component for reproducibility.
-    fn derive_nonce(&self, offset: u64) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
+    fn derive_nonce(offset: u64) -> [u8; Self::NONCE_SIZE] {
+        let mut nonce = [0u8; Self::NONCE_SIZE];
         nonce[0..8].copy_from_slice(&offset.to_le_bytes());
-        // Remaining 4 bytes are zero (could add version/counter if needed)
         nonce
     }
 }
 
-#[cfg(feature = "encryption")]
 impl PageCrypto for Aes256GcmPageCrypto {
     fn encrypt(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>> {
         assert_eq!(data.len(), page_size, "Input must be exactly page_size");
+        assert!(page_size > Self::OVERHEAD, "Page size must be > {} bytes", Self::OVERHEAD);
 
         // Skip encryption for header pages
         if offset < self.skip_below_offset {
             return Ok(data.to_vec());
         }
 
-        // Available space for ciphertext (after header)
-        let available = page_size - PageHeader::SIZE;
+        // Usable space for actual data
+        let usable = page_size - Self::OVERHEAD;
 
-        // Step 1: Always try to compress first (needed to fit data + GCM tag)
-        // Use dictionary if available for better compression
-        let compressed_data = if let Some(ref dict) = self.encoder_dict {
-            let mut output = Vec::new();
-            let mut encoder = zstd::stream::Encoder::with_prepared_dictionary(&mut output, dict.as_ref())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            io::copy(&mut io::Cursor::new(data), &mut encoder)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            encoder.finish()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            output
-        } else {
-            zstd::encode_all(data.as_ref(), self.compression_level)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-        };
+        // Encrypt only the usable portion (the rest is reserved/unused by B-tree)
+        let plaintext = &data[..usable];
+        let nonce = Self::derive_nonce(offset);
 
-        // Determine what to encrypt: use compressed if it fits, otherwise we have a problem
-        let (payload, is_compressed) = if compressed_data.len() + Self::TAG_SIZE <= available {
-            // Compression worked - use compressed data
-            (compressed_data, true)
-        } else if page_size + Self::TAG_SIZE <= available {
-            // Rare case: compression made it bigger but uncompressed fits
-            // This shouldn't happen with typical page sizes but handle it
-            (data.to_vec(), false)
-        } else {
-            // Page data won't fit - this means page_size is too small
-            // With 4096 byte pages: available = 4076, max payload = 4060
-            // Uncompressed 4096 bytes won't fit. Compression MUST reduce size.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Page data cannot be encrypted: compressed size {} + tag {} > available {}. \
-                     Page data must be compressible or use larger page size.",
-                    compressed_data.len(),
-                    Self::TAG_SIZE,
-                    available
-                ),
-            ));
-        };
-
-        // Step 2: Encrypt with AES-256-GCM
-        let nonce = self.derive_nonce(offset);
-        let ciphertext = self
+        let ciphertext_with_tag = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce), payload.as_ref())
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {e}")))?;
 
-        // Step 3: Build output page
-        let header = PageHeader {
-            ciphertext_len: ciphertext.len() as u32,
-            flags: if is_compressed { 0x01 } else { 0x00 },
-            _reserved: [0; 3],
-            nonce,
-        };
+        // ciphertext_with_tag length = usable + TAG_SIZE
+        assert_eq!(ciphertext_with_tag.len(), usable + Self::TAG_SIZE);
 
+        // Build output page: [nonce][ciphertext][tag]
         let mut output = Vec::with_capacity(page_size);
-        output.extend_from_slice(&header.to_bytes());
-        output.extend_from_slice(&ciphertext);
-        // Pad to page_size with zeros
-        output.resize(page_size, 0);
+        output.extend_from_slice(&nonce);
+        output.extend_from_slice(&ciphertext_with_tag);
+        assert_eq!(output.len(), page_size);
 
         Ok(output)
     }
 
     fn decrypt(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>> {
         assert_eq!(data.len(), page_size, "Input must be exactly page_size");
+        assert!(page_size > Self::OVERHEAD, "Page size must be > {} bytes", Self::OVERHEAD);
 
         // Skip decryption for header pages
         if offset < self.skip_below_offset {
             return Ok(data.to_vec());
         }
 
-        // Parse header
-        let header = PageHeader::from_bytes(&data[..PageHeader::SIZE]);
+        // Extract nonce and ciphertext+tag
+        let nonce = &data[..Self::NONCE_SIZE];
+        let ciphertext_with_tag = &data[Self::NONCE_SIZE..];
 
-        // Validate ciphertext length
-        let ciphertext_len = header.ciphertext_len as usize;
-
-        // Handle unencrypted/empty pages (ciphertext_len=0 means not encrypted)
-        // This can happen during database initialization or for newly allocated pages
-        if ciphertext_len == 0 {
-            // Page was never encrypted - return as-is
-            // This allows mixed encrypted/unencrypted databases during migration
+        // Handle unencrypted pages (all zeros in nonce area typically means unencrypted)
+        // This allows migration from unencrypted to encrypted databases
+        if nonce.iter().all(|&b| b == 0) && data[Self::NONCE_SIZE..Self::NONCE_SIZE + 8].iter().all(|&b| b == 0) {
             return Ok(data.to_vec());
         }
 
-        if PageHeader::SIZE + ciphertext_len > page_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid page header: ciphertext_len={} exceeds available space (header_size={}, page_size={})",
-                    ciphertext_len,
-                    PageHeader::SIZE,
-                    page_size
-                ),
-            ));
-        }
-
-        let ciphertext = &data[PageHeader::SIZE..PageHeader::SIZE + ciphertext_len];
-
-        // Decrypt
         let plaintext = self
             .cipher
-            .decrypt(Nonce::from_slice(&header.nonce), ciphertext)
+            .decrypt(Nonce::from_slice(nonce), ciphertext_with_tag)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {e}")))?;
 
-        // Decompress if needed (use dictionary if available)
-        let result = if header.is_compressed() {
-            if let Some(ref dict) = self.decoder_dict {
-                let mut output = Vec::new();
-                let mut decoder = zstd::stream::Decoder::with_prepared_dictionary(
-                    io::Cursor::new(&plaintext),
-                    dict.as_ref()
-                ).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                io::copy(&mut decoder, &mut output)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                output
-            } else {
-                zstd::decode_all(plaintext.as_slice())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-            }
-        } else {
-            plaintext
-        };
+        // Pad back to page_size (the reserved bytes are zeros)
+        let mut output = plaintext;
+        output.resize(page_size, 0);
 
-        // Verify size
-        if result.len() != page_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Decrypted page size mismatch: {} != {}",
-                    result.len(),
-                    page_size
-                ),
-            ));
-        }
-
-        Ok(result)
+        Ok(output)
     }
 
     fn encryption_start_offset(&self) -> u64 {
         self.skip_below_offset
+    }
+
+    fn overhead(&self) -> usize {
+        Self::OVERHEAD
     }
 }
 
@@ -383,55 +200,39 @@ impl PageCrypto for NoOpPageCrypto {
     }
 }
 
-#[cfg(all(test, feature = "encryption"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let key = [0x42u8; 32];
-        // Note: compression is always attempted internally now
-        let crypto = Aes256GcmPageCrypto::new(&key, true, false);
+        let crypto = Aes256GcmPageCrypto::new(&key, false);
         let page_size = 4096;
+        let usable = page_size - Aes256GcmPageCrypto::OVERHEAD;
 
-        // Use compressible data (typical for database pages with some zeros/structure)
+        // Create test data (only usable portion matters)
         let mut original = vec![0u8; page_size];
-        for i in 0..100 {
+        for i in 0..usable.min(256) {
             original[i] = (i % 256) as u8;
         }
 
         let encrypted = crypto.encrypt(4096, &original, page_size).unwrap();
         assert_eq!(encrypted.len(), page_size);
-        assert_ne!(encrypted, original);
+        assert_ne!(&encrypted[..usable], &original[..usable]);
 
         let decrypted = crypto.decrypt(4096, &encrypted, page_size).unwrap();
-        assert_eq!(decrypted, original);
-    }
-
-    #[test]
-    fn test_compress_encrypt_roundtrip() {
-        let key = [0x42u8; 32];
-        let crypto = Aes256GcmPageCrypto::new(&key, true, false);
-        let page_size = 4096;
-
-        // Highly compressible data
-        let original = vec![0u8; page_size];
-
-        let encrypted = crypto.encrypt(4096, &original, page_size).unwrap();
-        assert_eq!(encrypted.len(), page_size);
-
-        let decrypted = crypto.decrypt(4096, &encrypted, page_size).unwrap();
-        assert_eq!(decrypted, original);
+        // Only usable portion is preserved
+        assert_eq!(&decrypted[..usable], &original[..usable]);
     }
 
     #[test]
     fn test_skip_header_page() {
         let key = [0x42u8; 32];
-        let crypto = Aes256GcmPageCrypto::new(&key, true, true).with_skip_below_offset(4096);
+        let crypto = Aes256GcmPageCrypto::new(&key, true).with_skip_below_offset(4096);
         let page_size = 4096;
 
-        // Use compressible data
-        let original = vec![0u8; page_size];
+        let original = vec![0x42u8; page_size];
 
         // Header page (offset 0) should not be encrypted
         let header_result = crypto.encrypt(0, &original, page_size).unwrap();
@@ -443,25 +244,31 @@ mod tests {
     }
 
     #[test]
-    fn test_varied_data_roundtrip() {
+    fn test_random_data_roundtrip() {
         let key = [0x42u8; 32];
-        let crypto = Aes256GcmPageCrypto::new(&key, true, false);
+        let crypto = Aes256GcmPageCrypto::new(&key, false);
         let page_size = 4096;
+        let usable = page_size - Aes256GcmPageCrypto::OVERHEAD;
 
-        // Data with some structure (like a B+tree page would have)
+        // Incompressible random-ish data
         let mut original = vec![0u8; page_size];
-        // Header-like area
-        original[0..8].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-        // Some key-value pairs
-        for i in 0..50 {
-            let offset = 64 + i * 64;
-            original[offset..offset + 8].copy_from_slice(&(i as u64).to_le_bytes());
+        for i in 0..page_size {
+            original[i] = ((i * 17 + 31) % 256) as u8;
         }
 
         let encrypted = crypto.encrypt(4096, &original, page_size).unwrap();
         assert_eq!(encrypted.len(), page_size);
 
         let decrypted = crypto.decrypt(4096, &encrypted, page_size).unwrap();
-        assert_eq!(decrypted, original);
+        assert_eq!(&decrypted[..usable], &original[..usable]);
+    }
+
+    #[test]
+    fn test_overhead_constant() {
+        assert_eq!(Aes256GcmPageCrypto::OVERHEAD, 28);
+
+        let key = [0x42u8; 32];
+        let crypto = Aes256GcmPageCrypto::new(&key, false);
+        assert_eq!(crypto.overhead(), 28);
     }
 }

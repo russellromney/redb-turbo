@@ -111,9 +111,7 @@ mod tuple_types;
 mod types;
 
 // Re-export page crypto types
-pub use page_crypto::{NoOpPageCrypto, PageCrypto};
-#[cfg(feature = "encryption")]
-pub use page_crypto::Aes256GcmPageCrypto;
+pub use page_crypto::{Aes256GcmPageCrypto, NoOpPageCrypto, PageCrypto};
 
 #[cfg(test)]
 fn create_tempfile() -> tempfile::NamedTempFile {
