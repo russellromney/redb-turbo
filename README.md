@@ -7,9 +7,8 @@ A fork of [redb](https://github.com/cberner/redb) with **AES-256-GCM page encryp
 
 ## Installation
 
-```toml
-[dependencies]
-redb-turbo = "0.1"
+```bash
+cargo add redb-turbo
 ```
 
 ## Encryption
@@ -41,18 +40,9 @@ fn main() -> Result<(), redb_turbo::Error> {
 }
 ```
 
-### Page Format
+### How It Works
 
-Each 4KB page is encrypted independently:
-
-```
-[nonce: 12 bytes][ciphertext: 4068 bytes][auth tag: 16 bytes]
-```
-
-- **28 bytes overhead per page** (~0.7% space)
-- **Nonce**: Derived from page offset (deterministic, no storage needed)
-- **Auth tag**: GCM authentication tag that detects tampering/bit-flips
-- **Header page**: Left unencrypted for database bootstrapping
+We reserve 28 bytes per page for encryption overhead (~0.7% space for 4KB pages). This includes a 12-byte nonce derived from the page offset and a 16-byte authentication tag that detects tampering. The database header page is left unencrypted for bootstrapping.
 
 ## Benchmarks
 
