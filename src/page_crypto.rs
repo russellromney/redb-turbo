@@ -127,8 +127,18 @@ impl Aes256GcmPageCrypto {
 
 impl PageCrypto for Aes256GcmPageCrypto {
     fn encrypt(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>> {
-        assert_eq!(data.len(), page_size, "Input must be exactly page_size");
-        assert!(page_size > Self::OVERHEAD, "Page size must be > {} bytes", Self::OVERHEAD);
+        if data.len() != page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Input must be exactly page_size ({} bytes), got {}", page_size, data.len()),
+            ));
+        }
+        if page_size <= Self::OVERHEAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Page size must be > {} bytes, got {}", Self::OVERHEAD, page_size),
+            ));
+        }
 
         // Skip encryption for header pages
         if offset < self.skip_below_offset {
@@ -147,21 +157,31 @@ impl PageCrypto for Aes256GcmPageCrypto {
             .encrypt(Nonce::from_slice(&nonce), plaintext)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption failed: {e}")))?;
 
-        // ciphertext_with_tag length = usable + TAG_SIZE
-        assert_eq!(ciphertext_with_tag.len(), usable + Self::TAG_SIZE);
+        // ciphertext_with_tag length = usable + TAG_SIZE (internal invariant)
+        debug_assert_eq!(ciphertext_with_tag.len(), usable + Self::TAG_SIZE);
 
         // Build output page: [nonce][ciphertext][tag]
         let mut output = Vec::with_capacity(page_size);
         output.extend_from_slice(&nonce);
         output.extend_from_slice(&ciphertext_with_tag);
-        assert_eq!(output.len(), page_size);
+        debug_assert_eq!(output.len(), page_size);
 
         Ok(output)
     }
 
     fn decrypt(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>> {
-        assert_eq!(data.len(), page_size, "Input must be exactly page_size");
-        assert!(page_size > Self::OVERHEAD, "Page size must be > {} bytes", Self::OVERHEAD);
+        if data.len() != page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Input must be exactly page_size ({} bytes), got {}", page_size, data.len()),
+            ));
+        }
+        if page_size <= Self::OVERHEAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Page size must be > {} bytes, got {}", Self::OVERHEAD, page_size),
+            ));
+        }
 
         // Skip decryption for header pages
         if offset < self.skip_below_offset {
@@ -296,7 +316,12 @@ impl ZstdPageCompression {
 
 impl PageCompression for ZstdPageCompression {
     fn compress(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>> {
-        assert_eq!(data.len(), page_size, "Input must be exactly page_size");
+        if data.len() != page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Input must be exactly page_size ({} bytes), got {}", page_size, data.len()),
+            ));
+        }
 
         // Skip compression for header pages
         if offset < self.skip_below_offset {
@@ -331,7 +356,12 @@ impl PageCompression for ZstdPageCompression {
     }
 
     fn decompress(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>> {
-        assert_eq!(data.len(), page_size, "Input must be exactly page_size");
+        if data.len() != page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Input must be exactly page_size ({} bytes), got {}", page_size, data.len()),
+            ));
+        }
 
         // Skip decompression for header pages
         if offset < self.skip_below_offset {
@@ -497,7 +527,12 @@ impl ZstdDictPageCompression {
 
 impl PageCompression for ZstdDictPageCompression {
     fn compress(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>> {
-        assert_eq!(data.len(), page_size, "Input must be exactly page_size");
+        if data.len() != page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Input must be exactly page_size ({} bytes), got {}", page_size, data.len()),
+            ));
+        }
 
         // Skip compression for header pages
         if offset < self.skip_below_offset {
@@ -534,7 +569,12 @@ impl PageCompression for ZstdDictPageCompression {
     }
 
     fn decompress(&self, offset: u64, data: &[u8], page_size: usize) -> io::Result<Vec<u8>> {
-        assert_eq!(data.len(), page_size, "Input must be exactly page_size");
+        if data.len() != page_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Input must be exactly page_size ({} bytes), got {}", page_size, data.len()),
+            ));
+        }
 
         // Skip decompression for header pages
         if offset < self.skip_below_offset {
@@ -726,6 +766,74 @@ impl DictionaryTrainer {
         Ok((ratio_without, ratio_with))
     }
 }
+
+// ============================================================================
+// KEY ROTATION DOCUMENTATION
+// ============================================================================
+//
+// # Key Rotation
+//
+// To rotate encryption keys, create a new database with the new key and copy all data.
+// This requires 2x disk space temporarily but is the safest approach.
+//
+// ## Example: Rotate to a new encryption key
+//
+// ```rust,ignore
+// use redb_turbo::{Database, Aes256GcmPageCrypto, TableDefinition, ReadableTable};
+//
+// const MY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("my_table");
+//
+// fn rotate_key(
+//     source_path: &str,
+//     target_path: &str,
+//     old_key: &[u8; 32],
+//     new_key: &[u8; 32],
+// ) -> Result<(), redb_turbo::Error> {
+//     // Open source with old key
+//     let source_db = Database::builder()
+//         .set_page_crypto(Aes256GcmPageCrypto::new(old_key, true))
+//         .open(source_path)?;
+//
+//     // Create target with new key
+//     let target_db = Database::builder()
+//         .set_page_crypto(Aes256GcmPageCrypto::new(new_key, true))
+//         .create(target_path)?;
+//
+//     // Copy each table
+//     let read_txn = source_db.begin_read()?;
+//     let write_txn = target_db.begin_write()?;
+//     {
+//         let source_table = read_txn.open_table(MY_TABLE)?;
+//         let mut target_table = write_txn.open_table(MY_TABLE)?;
+//
+//         for entry in source_table.iter()? {
+//             let (key, value) = entry?;
+//             target_table.insert(key.value(), value.value())?;
+//         }
+//     }
+//     write_txn.commit()?;
+//
+//     // Optionally: rename target to source after verification
+//     // std::fs::rename(target_path, source_path)?;
+//
+//     Ok(())
+// }
+// ```
+//
+// ## Example: Migrate from unencrypted to encrypted
+//
+// ```rust,ignore
+// // Open unencrypted database
+// let source_db = Database::open("plain.redb")?;
+//
+// // Create encrypted database
+// let key = [0x42u8; 32];
+// let target_db = Database::builder()
+//     .set_page_crypto(Aes256GcmPageCrypto::new(&key, true))
+//     .create("encrypted.redb")?;
+//
+// // Copy tables as shown above
+// ```
 
 #[cfg(test)]
 mod tests {

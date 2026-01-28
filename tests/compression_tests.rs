@@ -1189,3 +1189,555 @@ fn dictionary_compression_with_encryption() {
         );
     }
 }
+
+// =============================================================================
+// Compaction Tests
+// =============================================================================
+
+#[test]
+fn compaction_with_compression() {
+    let tmpfile = create_tempfile();
+
+    let compression = create_compression();
+    let mut db = Database::builder()
+        .set_page_compression(compression)
+        .create(tmpfile.path())
+        .unwrap();
+
+    let big_value = vec![0u8; 100 * 1024]; // 100KB
+
+    // Insert 10MB of data
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..100 {
+            table.insert(i, big_value.as_slice()).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let file_size_before_delete = std::fs::metadata(tmpfile.path()).unwrap().len();
+
+    // Delete all data
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..100 {
+            table.remove(i).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    // File size should still be large (pages not reclaimed yet)
+    let file_size_after_delete = std::fs::metadata(tmpfile.path()).unwrap().len();
+    assert!(
+        file_size_after_delete >= file_size_before_delete / 2,
+        "File should not shrink much before compaction"
+    );
+
+    // Compact
+    let compacted = db.compact().unwrap();
+    assert!(compacted, "Compaction should have made progress");
+
+    // File size should be significantly smaller
+    let file_size_after_compact = std::fs::metadata(tmpfile.path()).unwrap().len();
+    assert!(
+        file_size_after_compact < file_size_before_delete / 2,
+        "File should be much smaller after compaction: before={}, after={}",
+        file_size_before_delete,
+        file_size_after_compact
+    );
+}
+
+#[test]
+fn compaction_with_encryption() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    let crypto = create_crypto(&key);
+    let mut db = Database::builder()
+        .set_page_crypto(crypto)
+        .create(tmpfile.path())
+        .unwrap();
+
+    let big_value = vec![0u8; 100 * 1024];
+
+    // Insert 10MB of data
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..100 {
+            table.insert(i, big_value.as_slice()).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let file_size_before_delete = std::fs::metadata(tmpfile.path()).unwrap().len();
+
+    // Delete all data
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..100 {
+            table.remove(i).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    // Compact
+    let compacted = db.compact().unwrap();
+    assert!(compacted, "Compaction should have made progress");
+
+    let file_size_after_compact = std::fs::metadata(tmpfile.path()).unwrap().len();
+    assert!(
+        file_size_after_compact < file_size_before_delete / 2,
+        "File should be smaller after compaction"
+    );
+}
+
+#[test]
+fn compaction_with_compression_and_encryption() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    let compression = create_compression();
+    let crypto = create_crypto(&key);
+    let mut db = Database::builder()
+        .set_page_compression(compression)
+        .set_page_crypto(crypto)
+        .create(tmpfile.path())
+        .unwrap();
+
+    let big_value = vec![0u8; 100 * 1024];
+
+    // Insert 10MB of data
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..100 {
+            table.insert(i, big_value.as_slice()).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let file_size_before_delete = std::fs::metadata(tmpfile.path()).unwrap().len();
+
+    // Delete all data
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..100 {
+            table.remove(i).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    // Compact
+    let compacted = db.compact().unwrap();
+    assert!(compacted, "Compaction should have made progress");
+
+    let file_size_after_compact = std::fs::metadata(tmpfile.path()).unwrap().len();
+    assert!(
+        file_size_after_compact < file_size_before_delete / 2,
+        "File should be smaller after compaction"
+    );
+
+    // Verify we can still read the table (even though it's empty)
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(U64_TABLE).unwrap();
+    assert_eq!(table.len().unwrap(), 0);
+}
+
+#[test]
+fn compaction_preserves_data_with_encryption() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    let compression = create_compression();
+    let crypto = create_crypto(&key);
+    let mut db = Database::builder()
+        .set_page_compression(compression)
+        .set_page_crypto(crypto)
+        .create(tmpfile.path())
+        .unwrap();
+
+    // Insert data
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..100 {
+            let value = format!("value_{}", i);
+            table.insert(i, value.as_bytes()).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    // Delete half the data to create fragmentation
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in (0..100).step_by(2) {
+            table.remove(i).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    // Compact
+    let _compacted = db.compact().unwrap();
+
+    // Verify remaining data is intact
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(U64_TABLE).unwrap();
+    assert_eq!(table.len().unwrap(), 50);
+
+    for i in (1..100).step_by(2) {
+        let expected = format!("value_{}", i);
+        let retrieved = table.get(i).unwrap().unwrap();
+        assert_eq!(retrieved.value(), expected.as_bytes());
+    }
+}
+
+#[test]
+fn compaction_reopen_after_compact() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Create, populate, delete, compact
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let mut db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let big_value = vec![0u8; 100 * 1024];
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            for i in 0..50 {
+                table.insert(i, big_value.as_slice()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+
+        // Keep some data
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            for i in 10..50 {
+                table.remove(i).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+
+        // Compact
+        db.compact().unwrap();
+    }
+
+    // Reopen and verify data
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.len().unwrap(), 10);
+
+        for i in 0..10 {
+            let value = table.get(i).unwrap().unwrap();
+            assert_eq!(value.value().len(), 100 * 1024);
+        }
+    }
+}
+
+// =============================================================================
+// Key Rotation Tests
+// =============================================================================
+
+#[test]
+fn key_rotation_change_encryption_key() {
+    let source_file = create_tempfile();
+    let target_file = create_tempfile();
+    let old_key = [0x42u8; 32];
+    let new_key = [0x99u8; 32];
+
+    // Create source database with old key
+    {
+        let crypto = create_crypto(&old_key);
+        let db = Database::builder()
+            .set_page_crypto(crypto)
+            .create(source_file.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            table.insert("secret1", "value1").unwrap();
+            table.insert("secret2", "value2").unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Rotate: open source with old key, create target with new key, copy data
+    {
+        let old_crypto = create_crypto(&old_key);
+        let source_db = Database::builder()
+            .set_page_crypto(old_crypto)
+            .open(source_file.path())
+            .unwrap();
+
+        let new_crypto = create_crypto(&new_key);
+        let target_db = Database::builder()
+            .set_page_crypto(new_crypto)
+            .create(target_file.path())
+            .unwrap();
+
+        // Copy all data
+        let read_txn = source_db.begin_read().unwrap();
+        let source_table = read_txn.open_table(TABLE).unwrap();
+
+        let write_txn = target_db.begin_write().unwrap();
+        {
+            let mut target_table = write_txn.open_table(TABLE).unwrap();
+            for entry in source_table.iter().unwrap() {
+                let (key, value) = entry.unwrap();
+                target_table.insert(key.value(), value.value()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify target database works with new key
+    {
+        let new_crypto = create_crypto(&new_key);
+        let db = Database::builder()
+            .set_page_crypto(new_crypto)
+            .open(target_file.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(TABLE).unwrap();
+        assert_eq!(table.get("secret1").unwrap().unwrap().value(), "value1");
+        assert_eq!(table.get("secret2").unwrap().unwrap().value(), "value2");
+    }
+
+    // Verify old key doesn't work on new database
+    {
+        let old_crypto = create_crypto(&old_key);
+        let result = Database::builder()
+            .set_page_crypto(old_crypto)
+            .open(target_file.path());
+        assert!(result.is_err(), "Old key should not work on rotated database");
+    }
+}
+
+#[test]
+fn key_rotation_unencrypted_to_encrypted() {
+    let source_file = create_tempfile();
+    let target_file = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Create source database without encryption
+    {
+        let db = Database::create(source_file.path()).unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            table.insert("plain1", "value1").unwrap();
+            table.insert("plain2", "value2").unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Migrate to encrypted database
+    {
+        let source_db = Database::open(source_file.path()).unwrap();
+
+        let crypto = create_crypto(&key);
+        let target_db = Database::builder()
+            .set_page_crypto(crypto)
+            .create(target_file.path())
+            .unwrap();
+
+        // Copy all data
+        let read_txn = source_db.begin_read().unwrap();
+        let source_table = read_txn.open_table(TABLE).unwrap();
+
+        let write_txn = target_db.begin_write().unwrap();
+        {
+            let mut target_table = write_txn.open_table(TABLE).unwrap();
+            for entry in source_table.iter().unwrap() {
+                let (key, value) = entry.unwrap();
+                target_table.insert(key.value(), value.value()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify target is encrypted (plaintext not on disk)
+    let file_contents = std::fs::read(target_file.path()).unwrap();
+    let contains_plaintext = file_contents
+        .windows("value1".len())
+        .any(|w| w == b"value1");
+    assert!(!contains_plaintext, "Plaintext should not be in encrypted file");
+
+    // Verify we can read with the key
+    {
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_crypto(crypto)
+            .open(target_file.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(TABLE).unwrap();
+        assert_eq!(table.get("plain1").unwrap().unwrap().value(), "value1");
+        assert_eq!(table.get("plain2").unwrap().unwrap().value(), "value2");
+    }
+}
+
+#[test]
+fn key_rotation_encrypted_to_unencrypted() {
+    let source_file = create_tempfile();
+    let target_file = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Create source database with encryption
+    {
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_crypto(crypto)
+            .create(source_file.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            table.insert("secret1", "decrypted_value1").unwrap();
+            table.insert("secret2", "decrypted_value2").unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Migrate to unencrypted database
+    {
+        let crypto = create_crypto(&key);
+        let source_db = Database::builder()
+            .set_page_crypto(crypto)
+            .open(source_file.path())
+            .unwrap();
+
+        let target_db = Database::create(target_file.path()).unwrap();
+
+        // Copy all data
+        let read_txn = source_db.begin_read().unwrap();
+        let source_table = read_txn.open_table(TABLE).unwrap();
+
+        let write_txn = target_db.begin_write().unwrap();
+        {
+            let mut target_table = write_txn.open_table(TABLE).unwrap();
+            for entry in source_table.iter().unwrap() {
+                let (k, v) = entry.unwrap();
+                target_table.insert(k.value(), v.value()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify target is readable without encryption
+    {
+        let db = Database::open(target_file.path()).unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(TABLE).unwrap();
+        assert_eq!(table.get("secret1").unwrap().unwrap().value(), "decrypted_value1");
+        assert_eq!(table.get("secret2").unwrap().unwrap().value(), "decrypted_value2");
+    }
+}
+
+#[test]
+fn key_rotation_with_compression_change() {
+    let source_file = create_tempfile();
+    let target_file = create_tempfile();
+    let old_key = [0x42u8; 32];
+    let new_key = [0x99u8; 32];
+
+    // Create source: encrypted, no compression
+    {
+        let crypto = create_crypto(&old_key);
+        let db = Database::builder()
+            .set_page_crypto(crypto)
+            .create(source_file.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            for i in 0..50 {
+                let value = format!("data_{}", i);
+                table.insert(i, value.as_bytes()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Migrate to: new key + compression
+    {
+        let old_crypto = create_crypto(&old_key);
+        let source_db = Database::builder()
+            .set_page_crypto(old_crypto)
+            .open(source_file.path())
+            .unwrap();
+
+        let compression = create_compression();
+        let new_crypto = create_crypto(&new_key);
+        let target_db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(new_crypto)
+            .create(target_file.path())
+            .unwrap();
+
+        // Copy all data
+        let read_txn = source_db.begin_read().unwrap();
+        let source_table = read_txn.open_table(U64_TABLE).unwrap();
+
+        let write_txn = target_db.begin_write().unwrap();
+        {
+            let mut target_table = write_txn.open_table(U64_TABLE).unwrap();
+            for entry in source_table.iter().unwrap() {
+                let (key, value) = entry.unwrap();
+                target_table.insert(key.value(), value.value()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify target database with new settings
+    {
+        let compression = create_compression();
+        let new_crypto = create_crypto(&new_key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(new_crypto)
+            .open(target_file.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.len().unwrap(), 50);
+
+        for i in 0..50 {
+            let expected = format!("data_{}", i);
+            let retrieved = table.get(i).unwrap().unwrap();
+            assert_eq!(retrieved.value(), expected.as_bytes());
+        }
+    }
+}
