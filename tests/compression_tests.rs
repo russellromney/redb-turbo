@@ -711,3 +711,481 @@ fn compression_and_encryption_transaction_rollback() {
     assert!(table.get("committed").unwrap().is_some());
     assert!(table.get("uncommitted").unwrap().is_none());
 }
+
+// =============================================================================
+// Edge Cases
+// =============================================================================
+
+#[test]
+fn edge_case_empty_table() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Create DB with compression+encryption but no data
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            // Just open the table, don't insert anything
+            let _table = write_txn.open_table(TABLE).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Reopen and verify empty table works
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(TABLE).unwrap();
+        assert_eq!(table.len().unwrap(), 0);
+        assert!(table.get("nonexistent").unwrap().is_none());
+    }
+}
+
+#[test]
+fn edge_case_single_byte_data() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Single byte key and value
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            table.insert(0, &[0x42u8][..]).unwrap();
+            table.insert(1, &[0x00u8][..]).unwrap();
+            table.insert(2, &[0xFFu8][..]).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.get(0).unwrap().unwrap().value(), &[0x42u8]);
+        assert_eq!(table.get(1).unwrap().unwrap().value(), &[0x00u8]);
+        assert_eq!(table.get(2).unwrap().unwrap().value(), &[0xFFu8]);
+    }
+}
+
+#[test]
+fn edge_case_incompressible_random_data() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Generate pseudo-random incompressible data
+    let random_data: Vec<u8> = (0..4000)
+        .map(|i| ((i * 17 + 31) ^ (i * 13 + 7)) as u8)
+        .collect();
+
+    // Write incompressible data
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            table.insert(1, random_data.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify data is still retrievable (compression falls back to uncompressed)
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.get(1).unwrap().unwrap().value(), random_data.as_slice());
+    }
+}
+
+#[test]
+fn edge_case_exact_page_boundary_data() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Data exactly at page boundary (4096 bytes)
+    let page_size_data: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            table.insert(1, page_size_data.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.get(1).unwrap().unwrap().value(), page_size_data.as_slice());
+    }
+}
+
+#[test]
+fn negative_open_encrypted_db_without_encryption() {
+    use std::panic;
+
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Create encrypted database
+    {
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            table.insert("secret", "data").unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Try to open without encryption - should fail (panic or error)
+    // This verifies that encrypted data is protected
+    let path = tmpfile.path().to_path_buf();
+    let result = panic::catch_unwind(move || {
+        let db = Database::open(&path)?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(TABLE)?;
+        let value = table.get("secret")?;
+        Ok::<_, redb::Error>(value.map(|v| v.value().to_string()))
+    });
+
+    // Should either panic (caught) or return error
+    // Success reading correct data would be a security failure
+    let failed = match result {
+        Err(_) => true, // Panicked - good
+        Ok(Err(_)) => true, // Returned error - good
+        Ok(Ok(None)) => true, // Data not found - acceptable
+        Ok(Ok(Some(val))) => val != "data", // Wrong data - acceptable
+    };
+
+    assert!(
+        failed,
+        "Opening encrypted DB without key should not return correct data"
+    );
+}
+
+#[test]
+fn negative_open_compressed_db_without_compression() {
+    use std::panic;
+
+    let tmpfile = create_tempfile();
+
+    // Create compressed database with significant data
+    {
+        let compression = create_compression();
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            // Write enough data to trigger compression
+            for i in 0..100u64 {
+                let data: Vec<u8> = (0..1000).map(|j| ((i as usize + j) % 64) as u8).collect();
+                table.insert(i, data.as_slice()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Try to open without compression - should fail (panic or error)
+    let path = tmpfile.path().to_path_buf();
+    let expected_data: Vec<u8> = (0..1000).map(|j| (j % 64) as u8).collect();
+
+    let result = panic::catch_unwind(move || {
+        let db = Database::open(&path)?;
+        let read_txn = db.begin_read()?;
+        let table = read_txn.open_table(U64_TABLE)?;
+        let value = table.get(0u64)?;
+        Ok::<_, redb::Error>(value.map(|v| v.value().to_vec()))
+    });
+
+    // Should either panic (caught) or return error or wrong data
+    let failed = match result {
+        Err(_) => true, // Panicked - good
+        Ok(Err(_)) => true, // Returned error - good
+        Ok(Ok(None)) => true, // Data not found - acceptable
+        Ok(Ok(Some(val))) => val != expected_data, // Wrong data - acceptable
+    };
+
+    assert!(
+        failed,
+        "Opening compressed DB without decompression should not return correct data"
+    );
+}
+
+#[test]
+fn edge_case_all_zeros_data() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // All zeros - highly compressible
+    let zeros: Vec<u8> = vec![0u8; 10000];
+
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            table.insert(1, zeros.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.get(1).unwrap().unwrap().value(), zeros.as_slice());
+    }
+}
+
+#[test]
+fn edge_case_all_ones_data() {
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // All 0xFF bytes - highly compressible
+    let ones: Vec<u8> = vec![0xFFu8; 10000];
+
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            table.insert(1, ones.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify
+    {
+        let compression = create_compression();
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+        assert_eq!(table.get(1).unwrap().unwrap().value(), ones.as_slice());
+    }
+}
+
+// =============================================================================
+// Dictionary Compression Integration Tests
+// =============================================================================
+
+#[test]
+fn dictionary_compression_roundtrip() {
+    use redb::{DictionaryTrainer, ZstdDictPageCompression};
+
+    let tmpfile = create_tempfile();
+
+    // Generate sample data for dictionary training
+    let samples: Vec<Vec<u8>> = (0..100)
+        .map(|i| {
+            (0..4096)
+                .map(|j| ((i * 3 + j) % 64) as u8)
+                .collect()
+        })
+        .collect();
+
+    // Train dictionary
+    let dict = DictionaryTrainer::train(&samples, 8192).unwrap();
+
+    // Write with dictionary compression
+    {
+        let compression = ZstdDictPageCompression::new(&dict, true);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(U64_TABLE).unwrap();
+            for i in 0..50 {
+                let data: Vec<u8> = (0..1000).map(|j| ((i + j) % 64) as u8).collect();
+                table.insert(i, data.as_slice()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Reopen with same dictionary and verify
+    {
+        let compression = ZstdDictPageCompression::new(&dict, true);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(U64_TABLE).unwrap();
+
+        for i in 0..50 {
+            let expected: Vec<u8> = (0..1000).map(|j| ((i + j) % 64) as u8).collect();
+            let retrieved = table.get(i).unwrap().unwrap();
+            assert_eq!(retrieved.value(), expected.as_slice());
+        }
+    }
+}
+
+#[test]
+fn dictionary_compression_with_encryption() {
+    use redb::{DictionaryTrainer, ZstdDictPageCompression};
+
+    let tmpfile = create_tempfile();
+    let key = [0x42u8; 32];
+
+    // Generate sample data for dictionary training
+    let samples: Vec<Vec<u8>> = (0..100)
+        .map(|i| {
+            (0..4096)
+                .map(|j| ((i * 3 + j) % 64) as u8)
+                .collect()
+        })
+        .collect();
+
+    // Train dictionary
+    let dict = DictionaryTrainer::train(&samples, 8192).unwrap();
+
+    // Write with dictionary compression + encryption
+    {
+        let compression = ZstdDictPageCompression::new(&dict, true);
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .create(tmpfile.path())
+            .unwrap();
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(TABLE).unwrap();
+            table.insert("secret", "dictionary_compressed_and_encrypted").unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    // Verify plaintext not on disk
+    let file_contents = std::fs::read(tmpfile.path()).unwrap();
+    let contains_plaintext = file_contents
+        .windows("dictionary_compressed".len())
+        .any(|w| w == b"dictionary_compressed");
+    assert!(!contains_plaintext, "Plaintext should not be in file");
+
+    // Reopen and verify
+    {
+        let compression = ZstdDictPageCompression::new(&dict, true);
+        let crypto = create_crypto(&key);
+        let db = Database::builder()
+            .set_page_compression(compression)
+            .set_page_crypto(crypto)
+            .open(tmpfile.path())
+            .unwrap();
+
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(TABLE).unwrap();
+        assert_eq!(
+            table.get("secret").unwrap().unwrap().value(),
+            "dictionary_compressed_and_encrypted"
+        );
+    }
+}
