@@ -44,19 +44,6 @@ fn main() -> Result<(), redb_turbo::Error> {
 
 We reserve 28 bytes per page for encryption overhead (~0.7% space for 4KB pages). This includes a 12-byte nonce derived from the page offset and a 16-byte authentication tag that detects tampering. The database header page is left unencrypted for bootstrapping.
 
-## Benchmarks
-
-```bash
-# Compare with other databases (lmdb, rocksdb, sled, etc.)
-cargo bench --bench lmdb_benchmark
-
-# Concurrent read/write performance
-cargo bench --bench concurrent_benchmark
-
-# Multi-threaded insert performance
-cargo bench --bench multithreaded_insert_benchmark
-```
-
 ---
 
 # Original redb Documentation
