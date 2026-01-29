@@ -12,3 +12,4 @@ You may obtain a copy of the License at
 
 Modifications in this fork include:
 - AES-256-GCM page-level encryption
+- ZSTD compression

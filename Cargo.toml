@@ -5,7 +5,7 @@ homepage = "https://github.com/russellromney/redb-turbo"
 repository = "https://github.com/russellromney/redb-turbo"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Russell Romney"]
@@ -39,7 +39,8 @@ redb1 = { version = "=1.0.0", package = "redb" }
 # for backwards compatibility testing - pin at 2.0.0
 redb2 = { version = "=2.0.0", package = "redb" }
 # for backwards compatibility testing - pin at 2.5.0
-redb2_5 = { git = "https://github.com/cberner/redb", tag="v2.5.0", package = "redb" }
+# NOTE: commented out for crates.io publish (git deps not allowed)
+# redb2_5 = { git = "https://github.com/cberner/redb", tag="v2.5.0", package = "redb" }
 bincode = "2.0.1"
 walkdir = "2.5.0"
 byte-unit = "5.1.6"
